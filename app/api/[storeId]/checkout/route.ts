@@ -1,7 +1,5 @@
-import Stripe from "stripe";
 import { NextResponse } from "next/server";
-
-import { stripe } from "@/lib/stripe";
+import { getMpesaAccessToken } from "@/lib/mpesa";
 import prismadb from "@/lib/prismadb";
 
 const corsHeaders = {
@@ -18,66 +16,71 @@ export async function POST(
   req: Request,
   { params }: { params: { storeId: string } }
 ) {
-  const { productIds } = await req.json();
+  const { phone, amount, userId, items } = await req.json();
 
-  if (!productIds || productIds.length === 0) {
-    return new NextResponse("Product ids are required", { status: 400 });
+  if (!phone || !amount || !userId || !items?.length) {
+    return new NextResponse("phone, amount, userId and items are required", { status: 400 });
   }
 
-  const products = await prismadb.product.findMany({
-    where: {
-      id: {
-        in: productIds
-      }
+  const token = await getMpesaAccessToken();
+
+  const timestamp = new Date()
+    .toISOString()
+    .replace(/[-T:.Z]/g, "")
+    .slice(0, 14);
+
+  const { MPESA_BUSINESS_SHORT_CODE, MPESA_PASSKEY, NEXT_PUBLIC_BACKEND_URL } = process.env;
+  const password = Buffer.from(`${MPESA_BUSINESS_SHORT_CODE}${MPESA_PASSKEY}${timestamp}`).toString("base64");
+
+  const stkRes = await fetch(
+    "https://sandbox.safaricom.co.ke/mpesa/stkpush/v1/processrequest",
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        BusinessShortCode: MPESA_BUSINESS_SHORT_CODE,
+        Password: password,
+        Timestamp: timestamp,
+        TransactionType: "CustomerPayBillOnline",
+        Amount: amount,
+        PartyA: phone,
+        PartyB: MPESA_BUSINESS_SHORT_CODE,
+        PhoneNumber: phone,
+        CallBackURL: `${NEXT_PUBLIC_BACKEND_URL}/api/${params.storeId}/mpesa/callback`,
+        AccountReference: "E-Shop",
+        TransactionDesc: "Order payment",
+      }),
     }
-  });
+  );
 
-  const line_items: Stripe.Checkout.SessionCreateParams.LineItem[] = [];
+  const stkData = await stkRes.json();
 
-  products.forEach((product) => {
-    line_items.push({
-      quantity: 1,
-      price_data: {
-        currency: 'USD',
-        product_data: {
-          name: product.name,
-        },
-        unit_amount: product.price.toNumber() * 100
-      }
-    });
-  });
+  if (!stkData.CheckoutRequestID) {
+    return new NextResponse(stkData.errorMessage || "STK push failed", { status: 502 });
+  }
+
+  const productIds: string[] = items.map((item: { id: string }) => item.id);
 
   const order = await prismadb.order.create({
     data: {
       storeId: params.storeId,
       isPaid: false,
+      phone,
+      userId,
+      checkoutRequestId: stkData.CheckoutRequestID,
       orderItems: {
-        create: productIds.map((productId: string) => ({
-          product: {
-            connect: {
-              id: productId
-            }
-          }
-        }))
-      }
-    }
-  });
-
-  const session = await stripe.checkout.sessions.create({
-    line_items,
-    mode: 'payment',
-    billing_address_collection: 'required',
-    phone_number_collection: {
-      enabled: true,
-    },
-    success_url: `${process.env.FRONTEND_STORE_URL}/cart?success=1`,
-    cancel_url: `${process.env.FRONTEND_STORE_URL}/cart?canceled=1`,
-    metadata: {
-      orderId: order.id
+        create: productIds.map((productId) => ({
+          product: { connect: { id: productId } },
+        })),
+      },
     },
   });
 
-  return NextResponse.json({ url: session.url }, {
-    headers: corsHeaders
-  });
-};
+  return NextResponse.json(
+    { checkoutRequestId: stkData.CheckoutRequestID, orderId: order.id },
+    { headers: corsHeaders }
+  );
+}
